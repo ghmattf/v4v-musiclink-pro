@@ -3,6 +3,13 @@
 All notable changes to the V4V Music Link Resolver Pro plugin are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/); versions follow [Semantic Versioning](https://semver.org/). The standard plugin lives in the sibling repository `ghmattf/v4v-musiclink`.
 
+## Resolver Pro (v4v-musiclink-pro) — [1.20.36] - 2026-10-12
+
+### Fixed
+
+- **Tracks Fountain's search index misses now resolve from the album page** — live-confirmed 2026-10-12 on a real phafe.com share link whose track guid Fountain's `searchContent` action does not index (19 hits unfiltered, 20 with a `["TRACK"]` filter, target guid in neither) even though the track is live on Fountain and appears in the album page's own tracklist. When the track-level search returns a readable "no match" for the track guid (`last_fountain_hits_parsed`, i.e. the action worked and the guid simply isn't in the index — never on a transport failure or stale next-action), `render()` now resolves the album guid (normally a 30-day cache hit from the album-level view), fetches that album's Fountain page with the existing 8 s / no-redirect settings, and reads the track's id straight out of the embedded `\"tracks\"` list via the new `fountain_track_id_from_album_page()` parser (backslash-quote RSC payload, `_id` charset guard, id + guid + `_type` required together). A hit produces the real deep link `https://fountain.fm/track/<id>` and is stored on the pair row exactly like a search hit; every failure (album unresolvable, page fetched without the track, over the per-IP resolve budget) falls through to the existing, never-stored Fountain search fallback. The album-page answer is negative-cached per album|track pair (`fountain_albumpage_pro_v1_*`, definitive-miss TTL when fetched-but-absent, soft TTL on transport failure) and charged to the same `resolve` budget as every other visitor-driven upstream attempt; resolution stays synchronous — the user declined async rendering. `test_stored_links` grows 195 → 213 with render pins S7–S10 (deep-link rendered + stored + link-half-only upsert + Music Index half untouched, missing-track negative-cache with definitive TTL, transport failure leaves the search fallback and sets no album GET, cached album-page miss short-circuits the GET), gated on Pro; `test_fountain_path` grows 34 → 37 with parser pins against an escaped-quote fixture. Pro-only: the standard plugin has no `?album=`/`?track=` intake and never resolves.
+
+
 ## Resolver Pro (v4v-musiclink-pro) — [1.20.35] - 2026-10-11
 
 ### Security
