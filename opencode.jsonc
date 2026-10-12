@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "permission": {
+    "read": {
+      "*/archive": "deny",
+      "*/archive/*": "deny"
+    },
+    "edit": {
+      "*/archive/*": "deny"
+    },
+    "bash": {
+      "*archive*": "deny"
+    }
+  },
+
+  "watcher": {
+    "ignore": ["**/archive/**"]
+  }
+}

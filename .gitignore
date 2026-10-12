@@ -1,0 +1,28 @@
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Dependencies / build artifacts (none currently; keep out if added)
+node_modules/
+vendor/
+
+# Portable PHP CLI - downloaded artifacts (recreate with php/install.sh)
+php/php
+php/*.tar.gz
+
+# Local env / secrets
+.env
+.env.local
+
+# WordPress debug artifacts
+wp-content/*-debug.log
+*.log
+tmp/
+
+# Version-history backups written by bump-version.sh - never project files
+archive/
