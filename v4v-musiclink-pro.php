@@ -2,7 +2,7 @@
 /**
  * Plugin Name: V4V Music Link Resolver Pro
  * Description: PRO EDITION - isolated copy of V4V Music Link Resolver with entirely separate settings/options/cache/database storage from the standard edition, safe to run alongside it on the same site without conflicts. Uses the [musiclink_pro] shortcode (not [musiclink]). Provides guid-based cross-platform music links (Stablekraft, PodTunes.app, v4vmusic.com, Fountain) based on ?album={guid}&track={guid} in the page URL. With no guid supplied, shows a Music Index search box instead.
- * Version: 1.20.35
+ * Version: 1.20.36
  * Author: Matt Finlay
  *
  * USAGE:
@@ -2606,7 +2606,7 @@ class V4V_Music_Link_Resolver_Pro {
 		wp_enqueue_style( 'v4v-musiclink-pro' );
 		wp_add_inline_style( 'v4v-musiclink-pro', $this->inline_css() );
 
-		wp_register_script( 'v4v-musiclink-pro', false, array(), '1.20.35', true );
+		wp_register_script( 'v4v-musiclink-pro', false, array(), '1.20.36', true );
 		wp_enqueue_script( 'v4v-musiclink-pro' );
 		wp_localize_script( 'v4v-musiclink-pro', 'v4vMusicLinkPro', array(
 			'ajaxUrl'   => admin_url( 'admin-ajax.php' ),
@@ -3277,6 +3277,18 @@ JS;
 				$fountain_target_guid = $fountain_has_track ? $track : $album;
 				$fountain_hit         = $fountain_search_text ? $this->fountain_resolve( $fountain_target_guid, $fountain_search_text ) : null;
 
+				// A readable "no match" from the search action (the guid
+				// simply isn't in Fountain's search index - live-confirmed
+				// for releases whose track the album page still lists)
+				// enables the album-page fallback below. Captured right
+				// after the call because any nested fountain_resolve()
+				// resets the flag. An unhittable search (transport, stale
+				// next-action) leaves it false - that state gets no extra
+				// GET, only the unchanged search fallback.
+				$fountain_search_missed = ! $fountain_hit
+					&& $fountain_search_text
+					&& $this->last_fountain_hits_parsed;
+
 				if ( $fountain_hit ) {
 					// The path prefix comes from Fountain's own _type on the
 					// matched hit - see fountain_path_segment().
@@ -3291,6 +3303,33 @@ JS;
 					// would pin a generic Fountain link to this release
 					// forever.
 					$this->store_fountain_link( $album, $track, $fountain_url, $album_title, $track_title, $artist );
+				} elseif ( $fountain_search_missed && $fountain_has_track ) {
+					// Track guid definitively absent from the SEARCH
+					// index, but Fountain often still lists the track on
+					// its ALBUM page (live-confirmed 2026-10-12). Resolve
+					// the album - normally a 30-day cache hit from the
+					// album-level view - and read the track's id straight
+					// off that page. A hit here is a real deep link, so
+					// it is stored exactly like a search hit; every miss
+					// falls through to the search fallback untouched.
+					$album_fountain_hit = $album_title
+						? $this->fountain_resolve( $album, $album_title )
+						: null;
+					$track_fountain_id  = $album_fountain_hit
+						? $this->fountain_track_via_album_page( $album_fountain_hit['id'], $track )
+						: null;
+
+					if ( $track_fountain_id ) {
+						$fountain_url = 'https://fountain.fm/track/'
+							. rawurlencode( $track_fountain_id );
+						$this->store_fountain_link( $album, $track, $fountain_url, $album_title, $track_title, $artist );
+					} elseif ( $fountain_search_text ) {
+						// Album unresolvable, page fetched without the
+						// track, or over budget: same search fallback as
+						// below (generic - never stored).
+						$fountain_url = 'https://fountain.fm/search?q='
+							. urlencode( '"' . $fountain_search_text . '"' );
+					}
 				} elseif ( $fountain_search_text ) {
 					// Unresolved (or no cached link): hand the visitor
 					// Fountain's own search results for this release -
@@ -4043,6 +4082,113 @@ JS;
 		}
 
 		return $has_track ? 'track' : 'album';
+	}
+
+	/**
+	 * The Fountain id for a track guid, read from an album page's own
+	 * embedded payload - the deterministic fallback for a release whose
+	 * track Fountain's SEARCH index omits while its album page still
+	 * lists it (live-confirmed 2026-10-12: searchContent returns no
+	 * TRACK hit for a guid the album page carries).
+	 *
+	 * Fountain renders album pages with a "tracks" array whose entries
+	 * are {"_id":...,"_guid":...,"_type":"TRACK"} - the _id immediately
+	 * precedes the _guid, so matching that exact shape pins the entry
+	 * and can never be fooled by the guid appearing elsewhere on the
+	 * page (artist:guid tags, image URLs, etc.).
+	 *
+	 * @param string $raw_body  Raw album-page HTML (escaped RSC payload and all).
+	 * @param string $track_guid Guid being resolved.
+	 * @return string|null The Fountain id, or null when absent/unparseable.
+	 */
+	private function fountain_track_id_from_album_page( $raw_body, $track_guid ) {
+		if ( ! is_string( $raw_body ) || ! is_string( $track_guid ) || '' === $track_guid ) {
+			return null;
+		}
+
+		// The page embeds the payload as an escaped JS string, so the
+		// entry shape arrives with LITERAL backslash-quote pairs:
+		// \"_id\":\"...\",\"_guid\":\"...\". preg_quote the exact byte
+		// sequences so the backslashes are matched, not treated as
+		// regex escapes. The id charset is Fountain's opaque
+		// base64url-style alphabet, enforced by the capture itself.
+		$pattern = '/'
+			. preg_quote( '\\"_id\\":\\"', '/' )
+			. '([A-Za-z0-9_-]+)'
+			. preg_quote( '\",\\"_guid\\":\\"', '/' )
+			. preg_quote( $track_guid, '/' )
+			. preg_quote( '\\"', '/' )
+			. '/';
+		if ( preg_match( $pattern, $raw_body, $matches ) ) {
+			return $matches[1];
+		}
+
+		return null;
+	}
+
+	/**
+	 * Resolves a track guid through its ALBUM's Fountain page when the
+	 * search action has definitively no match for it. One GET of the
+	 * album page (whose Fountain id is normally already cached from the
+	 * album-level resolve), parsed for the track's own entry.
+	 *
+	 * Misses are negative-cached per album/track pair for FAIL_CACHE_TTL
+	 * so an unlisted track costs one GET per hour at worst; successes
+	 * need no transient here because the caller stores the deep link on
+	 * the cache row, which short-circuits this path entirely from then
+	 * on. Charged to the same per-IP resolve budget as the search POSTs
+	 * (security review O25), and only ever called after a DEFINITIVE
+	 * search miss - a transport failure or stale next-action must not
+	 * spend an extra GET on a page that would answer the same way.
+	 *
+	 * @param string $album_fountain_id Fountain id of the ALBUM (not a guid).
+	 * @param string $track_guid        Track guid to find on that page.
+	 * @return string|null Fountain track id, or null on any miss.
+	 */
+	private function fountain_track_via_album_page( $album_fountain_id, $track_guid ) {
+		// Ids are Fountain's opaque tokens; anything else never reaches
+		// the URL (belt-and-braces beside rawurlencode below).
+		if ( ! is_string( $album_fountain_id ) || ! preg_match( '/^[A-Za-z0-9_-]{1,128}$/', $album_fountain_id ) ) {
+			return null;
+		}
+
+		$cache_key = 'fountain_albumpage_pro_v1_' . md5( $album_fountain_id . '|' . $track_guid );
+		$cached    = get_transient( $cache_key );
+		if ( false !== $cached ) {
+			return $cached ? $cached : null;
+		}
+
+		if ( $this->resolve_budgeted && $this->is_rate_limited( 'resolve', self::RESOLVE_RATE_MAX, MINUTE_IN_SECONDS ) ) {
+			return null;
+		}
+
+		// Same SSRF hardening as every other outbound call: fixed host,
+		// no redirects followed.
+		$response = wp_remote_get( 'https://fountain.fm/album/' . rawurlencode( $album_fountain_id ), array(
+			'timeout'     => 8,
+			'redirection' => 0,
+			'user-agent'  => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
+		) );
+
+		$fetched = ! is_wp_error( $response ) && 200 === (int) wp_remote_retrieve_response_code( $response );
+		$id      = $fetched
+			? $this->fountain_track_id_from_album_page( wp_remote_retrieve_body( $response ), $track_guid )
+			: null;
+
+		if ( ! $id ) {
+			// TTL from THIS request's outcome, not last_fountain_status
+			// (which still describes the search POST that led here): a
+			// fetched page without the track is definitive, a transport
+			// failure is unconfirmed - same policy as the search misses.
+			set_transient(
+				$cache_key,
+				'',
+				$fetched ? self::FAIL_CACHE_TTL : self::SOFT_FAIL_CACHE_TTL
+			);
+			return null;
+		}
+
+		return $id;
 	}
 
 	/**
