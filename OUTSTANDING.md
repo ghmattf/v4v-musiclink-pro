@@ -203,7 +203,8 @@ probe below; no code changes made, re-open only on request).
 **Scope superseded by O28 (2026-11-21):** the user re-picked the
 official-API migration with p20-link-resolver's no-key `/v1/search/lookup`
 as the model. O28 absorbs this item when it ships - keep the probe record
-below until then.
+below until then. (O28's Pro half is implemented 2026-11-23, pending
+release; O10 goes at that release.)
 
 **2026-10-05 note:** nothing is blocked on O10 - the O11 fix shipped
 through the internal server-action path instead (probe every detected
@@ -454,14 +455,17 @@ README usage sections for both versions gain the attribute.
 
 ---
 
-## O28. Fountain official API support (both plugins) - port p20-link-resolver's no-key lookup
+## O28. Fountain official API support (Pro only) - port p20-link-resolver's no-key lookup
 
-**Status: Planned** (user picked 2026-11-21, for both plugins, pointing at
-the podcast sibling's working implementation; implement only on request).
+**Status: Open** - implemented in this repo 2026-11-23, pending release;
+remove this entry when the version ships (`CHANGELOG.md` + git carry it
+from then on).
 
-**Applies to both plugins; also tracked in the sibling repository (`ghmattf/v4v-musiclink`
-for standard / `ghmattf/v4v-musiclink-pro` for Pro) since the 2026-10-11 repo split -
-implement only this repo's half.**
+**Scope: Pro only** (user confirmed O28/O29 affect this plugin alone;
+the "Applies to both plugins / also tracked in the sibling repository"
+tracking from 2026-11-21 is dropped, and the standard-plugin halves
+described below - render block std 2316-2356, `get_cached_fountain_url()`
+864, its deliberate no-resolve design - are out of scope, untouched).
 
 **What:** move Fountain deep-link resolution onto the documented public API
 (`api.fountain.fm/v1`, docs `fountain.fm/docs.md`) as `p20-link-resolver`
@@ -519,6 +523,39 @@ never-store-fallbacks rule at Pro 3300-3304); copy p20's miss-caching
 discipline and add a schema constant to invalidate remembered lookups; tests
 in `tests/`, README + CHANGELOG; ship independently per repo.
 
+**Implemented 2026-11-23 (Pro half only; standard half never picked):**
+- New `const FOUNTAIN_API_SCHEMA = 1` and
+  `fountain_api_resolve( $guid, $parent_guid = '' )`, called FIRST from
+  `fountain_resolve( $guid, $search_text, $parent_guid = '' )` - render
+  passes the album guid as the parent when the target is the track (the
+  only context that holds both), so a track goes up as
+  `podcast:item:guid:` + `parent` and a feed as `podcast:guid:` alone.
+  Tri-state: array hit / `''` definitive miss / `false` unreliable /
+  `null` not attempted (over budget - no HTTP, nothing remembered, so the
+  `resolve` window rather than the cache bounds a burst, O25).
+  Cache `fountain_api_pro_v{schema}_md5(guid|parent)`: hit 30 days,
+  definitive `''` at `FAIL_CACHE_TTL`, unreliable under the `~` sentinel
+  at `SOFT_FAIL_CACHE_TTL`.
+- Legacy body extracted unchanged as `fountain_resolve_legacy()` and kept
+  as automatic fallback for every non-hit outcome; a definitive API miss
+  promotes `last_fountain_hits_parsed` after the legacy attempt so the
+  render's album-page track fallback still fires when the legacy path
+  could not parse an answer of its own.
+- Probes resolved 2026-11-21 (from Matt's machine): feed guid ->
+  `ALBUM 9aSjTQRfSX1vb3dStBWs`, track + parent -> `TRACK
+  qkMEo45HgMB0uZ5tUlXE`, track without parent -> 400/empty, unknown guid
+  -> 200 with empty `hits` (definitive), reverse needs the `:id:` form
+  (`:guid:` -> 400, wrong type -> 500). Music unknown 1 above: answered
+  - Music Index guids are accepted.
+- Tests: new `tests/fountain_api_test.php` (35 pins: payload shapes,
+  cache keys/TTLs, miss discipline, budget gate, fallback + flag
+  promotion, `{type}:id:` stripping, id-alphabet refusal);
+  `fountain_fix_test` section E now filters to legacy `fountain.fm/search`
+  POSTs; `test_stored_links` warms both resolver caches; `fountain_live_test`
+  gains an `api`/`legacy` per-case expectation (API cases live-green
+  2026-11-23; the legacy case pins the API miss + that the fallback ran,
+  and reports fountain.fm's dead server action as a NOTE - O9).
+
 **Relationship to existing items:** absorbs O10 when it ships - remove O10
 then; O10 keeps the 2026-09-26 probe record until that point. Also the
 long-term fix for O7/O9/O11's redeploy churn (self-heal becomes unnecessary
@@ -527,14 +564,16 @@ official-API migration" under Closed decisions - re-requested by the user
 2026-11-21 with p20's working no-key precedent.
 ---
 
-## O29. Paste an app share link in search -> jump straight to that release (both plugins)
+## O29. Paste an app share link in search -> jump straight to that release (Pro only)
 
-**Status: Planned** (user picked 2026-11-21, for both plugins, pointing at
-p20-link-resolver's search; implement only on request).
+**Status: Open** - implemented in this repo 2026-11-23, pending release;
+remove this entry when the version ships (`CHANGELOG.md` + git carry it
+from then on).
 
-**Applies to both plugins; also tracked in the sibling repository (`ghmattf/v4v-musiclink`
-for standard / `ghmattf/v4v-musiclink-pro` for Pro) since the 2026-10-11 repo split -
-implement only this repo's half.**
+**Scope: Pro only** (user confirmed O28/O29 affect this plugin alone;
+the "Applies to both plugins / also tracked in the sibling repository"
+tracking from 2026-11-21 is dropped - standard's `rest_search()` 2991 is
+untouched).
 
 **What:** today a pasted share link falls into `mi_search_hits()` (Music
 Index title search) and finds nothing. Recognise a pasted share URL for one
@@ -588,6 +627,37 @@ then a host switch for the three guid-carrying apps); wire into both search
 endpoints; extend `tests/` (pure-parse shapes assert no HTTP; Fountain
 reverse mocked; plain-title search unchanged); README + CHANGELOG; ship
 independently per repo.
+
+**Implemented 2026-11-23 (Pro half only; standard half never picked):**
+- `search_direct_link( $q )` wired into `ajax_search()` right after the
+  empty-query check and BEFORE `is_rate_limited( 'search', 30, MINUTE )`:
+  `null` falls through to the title search, `array()` returns the empty
+  payload (never title-searching the URL text), `false` sends
+  `wp_send_json_error( null, 502 )`, a direct payload becomes one result
+  with `page = 1` / `has_more = false` - the browser JS already navigates
+  on `album_guid`/`track_guid`, so no front-end change.
+- Helpers: `search_fountain_link()` (cache-row `fountain_url` match first
+  - zero HTTP, then `fountain_reverse()` against
+  `GET api.fountain.fm/v1/content/{kind}:id:{id}`), `search_app_link()`
+  host switch (`stablekraft.app/album/{a}[?track=]`,
+  `podtunes.app/g/{a}[/{t}]`, `v4vmusic.com/lookup/{a}[/{t}]`, scheme
+  prepend, `www.` strip, `rawurldecode`, `guard_guid`, `~`-delimited
+  regexes - `#` collides with the `#` inside `[^/?#]`), `direct_pair()`,
+  `search_result_row()` (row shape extracted from the MI hit loop, shared
+  by both paths), `row_has_cached_mi()`, `search_rate_limited()` (per-request
+  memo: the single search unit is spent only when an upstream call will
+  actually go out, and at most once per request).
+- Caching: `fountain_frv_pro_v{FOUNTAIN_API_SCHEMA}_md5(kind|id)` with
+  p20's definitive-vs-soft split (`''` at `FAIL_CACHE_TTL`, `~` at
+  `SOFT_FAIL_CACHE_TTL`); the shared schema constant invalidates both
+  O28 lookups and O29 reversals together.
+- Music unknown (reversed RSS guid == Music Index guid): answered live
+  2026-11-21 - `parent._guid` / `links: album:guid:` carry the feed guid.
+- Tests: new `tests/test_direct_link.php` (55 pins: the four-link shapes,
+  decode/guard handling, single-unit charging, cache-row shortcut with
+  zero HTTP, definitive vs soft misses, budget 502/429, unusable and
+  unrecognised input, untitlable direct result); `test_search_pagination`
+  gained the `wp_parse_url()` stub the detection path needs.
 ---
 
 ## Closed decisions (context only - not work items; do not re-open or re-propose)

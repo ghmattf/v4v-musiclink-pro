@@ -231,6 +231,13 @@ class V4V_Music_Link_Resolver_Pro {
 	const SEARCH_CACHE_SCHEMA    = 2;
 	const SEARCH_CACHE_TTL       = HOUR_IN_SECONDS;
 
+	// Namespaces the Fountain OFFICIAL-API transients in both directions
+	// (guid -> id in fountain_api_resolve(), id -> guids in
+	// fountain_reverse()), so a change to either response shape or miss
+	// policy can invalidate remembered answers by bumping this one
+	// constant (O28 resolution, O29 paste-a-link reversal).
+	const FOUNTAIN_API_SCHEMA = 1;
+
 	// Per-IP budget, attempts per minute, for the visitor-driven resolve
 	// path (security review O25): Music Index GETs and Fountain POSTs
 	// issued while rendering a ?album=/?track= share page or its
@@ -267,6 +274,17 @@ class V4V_Music_Link_Resolver_Pro {
 	 * shape we understand, so the miss is unconfirmed.
 	 */
 	private $last_fountain_hits_parsed = false;
+
+	/**
+	 * The search relay's rate-limit verdict for THIS request (null = not
+	 * asked yet). The direct-link branch (O29) may need the budget twice
+	 * - once for a Fountain reversal, once for the Music Index title
+	 * fetch - so the first upstream-dependent branch spends the single
+	 * unit and remembers the answer; a pure-parse shape with cached
+	 * titles never asks at all, and an over-budget verdict keeps holding
+	 * for the rest of the request.
+	 */
+	private $search_rate_verdict = null;
 
 	/**
 	 * Whether a stale cache row may queue a background Music Index
@@ -3242,16 +3260,18 @@ JS;
 			);
 		}
 
-		// --- Fountain: no reliable public link exists via guid or their
-		// search page directly (both confirmed to 404 - see project notes).
-		// Their ONLY resolution mechanism is an unofficial, undocumented
-		// Next.js Server Action - fragile because its "next-action" build
-		// fingerprint changes whenever Fountain redeploys. We call it here,
-		// but cache successes for a long time and always fall back to a
+		// --- Fountain: resolved through the official no-key API first
+		// (POST api.fountain.fm/v1/search/lookup, the same call
+		// p20-link-resolver uses - see fountain_api_resolve()). When that
+		// cannot answer (unreachable, or a miss the API cannot make with
+		// the guids we have), the unofficial Next.js Server Action path
+		// remains as automatic fallback: its "next-action" build
+		// fingerprint changes whenever Fountain redeploys, so successes
+		// there are cached long and every failure falls back to a
 		// Fountain search for the release title (or fountain.fm/discover
-		// when no title is known) on any failure, so a stale/broken hash
-		// never breaks the button - it just stops being a direct link
-		// until the hash is refreshed (see FOUNTAIN_NEXT_ACTION below).
+		// when no title is known) - a stale/broken hash never breaks the
+		// button, it just stops being a direct link until refreshed
+		// (see FOUNTAIN_NEXT_ACTION below).
 		if ( $this->is_app_enabled( 'fountain' ) ) {
 			$fountain_url = 'https://fountain.fm/discover';
 
@@ -3275,7 +3295,13 @@ JS;
 				$fountain_has_track   = $has_track && $track_data;
 				$fountain_search_text = $fountain_has_track ? $track_data['title'] : ( $feed_data ? $feed_data['title'] : '' );
 				$fountain_target_guid = $fountain_has_track ? $track : $album;
-				$fountain_hit         = $fountain_search_text ? $this->fountain_resolve( $fountain_target_guid, $fountain_search_text ) : null;
+				// The album guid doubles as the lookup PARENT for a track
+				// target: the official API only accepts an item guid
+				// together with its feed parent (O28), and this render is
+				// the one context that always holds both.
+				$fountain_hit         = $fountain_search_text
+					? $this->fountain_resolve( $fountain_target_guid, $fountain_search_text, $fountain_has_track ? $album : '' )
+					: null;
 
 				// A readable "no match" from the search action (the guid
 				// simply isn't in Fountain's search index - live-confirmed
@@ -3557,6 +3583,11 @@ JS;
 	 * contain guids, not display text) before returning results to the
 	 * browser.
 	 *
+	 * A pasted share link for one of the target apps (O29) is recognised
+	 * first and jumps straight to that release - see search_direct_link()
+	 * for the null / array() / false contract that keeps plain titles on
+	 * the normal path above.
+	 *
 	 * Results are paginated server-side in Music Index's relevance order.
 	 * Because the endpoint only offers opaque cursors (never an offset or a
 	 * total), a grand total cannot be reported - the response says whether
@@ -3581,9 +3612,57 @@ JS;
 			wp_send_json_success( $payload );
 		}
 
+		// A pasted app share link (O29) resolves to guids and returns the
+		// one matching result, so the click below - and only the click -
+		// navigates to that release. Detection runs BEFORE the rate limit:
+		// the guid-carrying shapes are pure parsing (no upstream budget to
+		// spend), and the branches that do reach out (the Fountain
+		// reversal, the Music Index title fetch) charge it themselves via
+		// search_rate_limited(). null = not a share link at all, so plain
+		// titles fall through to the title search unchanged.
+		$direct = $this->search_direct_link( $query );
+		if ( null !== $direct ) {
+			if ( false === $direct ) {
+				// Unreliable answer (transport/5xx, or over budget): an
+				// empty failure. A blip is remembered only for seconds
+				// under the '~' sentinel (never as a definitive miss),
+				// so the next paste retries shortly without hammering a
+				// struggling API; an over-budget verdict writes nothing
+				// at all and the window alone limits the burst.
+				wp_send_json_error( null, 502 );
+			}
+			if ( array() === $direct ) {
+				// Recognised but definitively absent/unusable - show "no
+				// results" and NEVER title-search the URL text.
+				wp_send_json_success( $payload );
+			}
+
+			// Titles for the single direct result come from the same cache
+			// row + Music Index detail lookups the loop below uses. The
+			// budget is charged only when those lookups will actually go
+			// out (no row with MI data on file yet).
+			if ( ! $this->row_has_cached_mi( $direct['album_guid'], (string) $direct['track_guid'] )
+				&& $this->search_rate_limited() ) {
+				wp_send_json_error( null, 502 );
+			}
+			$row = $this->search_result_row( $direct['album_guid'], $direct['track_guid'] );
+			if ( ! $row ) {
+				// Titles could not be resolved (Music Index answered 404 -
+				// the guids it does not know cannot be rendered on this
+				// site either - or failed outright): reported as an
+				// upstream error, not as "no results" - the link WAS
+				// recognised, and the next paste retries.
+				wp_send_json_error( null, 502 );
+			}
+			$payload['results'][] = $row;
+			$payload['page']      = 1; // One direct hit: its own single page.
+			wp_send_json_success( $payload );
+		}
+
 		// Bound the upstream relay per client before it can spend any
-		// outbound requests - see is_rate_limited() for the window semantics.
-		if ( $this->is_rate_limited( 'search', 30, MINUTE_IN_SECONDS ) ) {
+		// outbound requests - see is_rate_limited() for the window
+		// semantics, and search_rate_limited() for the per-request memo.
+		if ( $this->search_rate_limited() ) {
 			wp_send_json_error( null, 429 );
 		}
 
@@ -3603,39 +3682,13 @@ JS;
 			$seen[ $key ] = true;
 
 			$album_guid_for_hit = ( 'track' === $hit['entity_type'] ) ? $hit['feed_guid'] : $hit['entity_id'];
+			$track_guid_for_hit = ( 'track' === $hit['entity_type'] ) ? $hit['entity_id'] : null;
 
-			if ( 'track' === $hit['entity_type'] ) {
-				$track_data = $this->mi_get_track( $album_guid_for_hit, $hit['entity_id'] );
-				if ( ! $track_data ) {
-					continue;
-				}
-				$payload['results'][] = array(
-					'album_guid' => $album_guid_for_hit,
-					'track_guid' => $hit['entity_id'],
-					'title'      => $track_data['title'],
-					'subtitle'   => trim( sprintf(
-						/* translators: 1: album title, 2: artist name */
-						__( 'from %1$s · %2$s', 'v4v-musiclink-pro' ),
-						$track_data['album_title'],
-						$track_data['artist']
-					), " ·" ),
-				);
-			} else {
-				// Anything not explicitly a track (e.g. "feed"/"album") is
-				// treated as an album-level hit.
-				$feed_data = $this->mi_get_feed( $album_guid_for_hit );
-				if ( ! $feed_data ) {
-					continue;
-				}
-				$payload['results'][] = array(
-					'album_guid' => $album_guid_for_hit,
-					'track_guid' => null,
-					'title'      => $feed_data['title'],
-					'subtitle'   => $feed_data['artist']
-						? sprintf( __( 'Album by %s', 'v4v-musiclink-pro' ), $feed_data['artist'] )
-						: __( 'Album', 'v4v-musiclink-pro' ),
-				);
+			$row = $this->search_result_row( $album_guid_for_hit, $track_guid_for_hit );
+			if ( ! $row ) {
+				continue;
 			}
+			$payload['results'][] = $row;
 		}
 
 		// Another page exists if we already hold hits beyond this one, or if
@@ -3649,12 +3702,548 @@ JS;
 	}
 
 	/**
+	 * The search relay's per-client rate limit, asked at most once per
+	 * request: the first upstream-dependent branch spends the single unit
+	 * and remembers the verdict for the rest of this request, so one
+	 * pasted link that needs both a Fountain reversal and a Music Index
+	 * title fetch is charged exactly like a plain search, while a
+	 * pure-parse shape with cached titles never asks at all (O29).
+	 * Window semantics stay those of is_rate_limited().
+	 */
+	private function search_rate_limited() {
+		if ( null === $this->search_rate_verdict ) {
+			$this->search_rate_verdict = $this->is_rate_limited( 'search', 30, MINUTE_IN_SECONDS );
+		}
+
+		return $this->search_rate_verdict;
+	}
+
+	/**
+	 * One search-result row: the guids plus resolved display text, in the
+	 * exact shape the browser's result list renders (and turns into the
+	 * ?album=/?track= jump on click). Shared by the Music Index hit loop
+	 * and the direct-link branch (O29) so both render identically.
+	 *
+	 * @param string      $album_guid Album/feed guid the row is about.
+	 * @param string|null $track_guid Track guid, or null for an album-level result.
+	 * @return array|null null when Music Index could not supply titles for the pair.
+	 */
+	private function search_result_row( $album_guid, $track_guid ) {
+		if ( $track_guid ) {
+			$track_data = $this->mi_get_track( $album_guid, $track_guid );
+			if ( ! $track_data ) {
+				return null;
+			}
+			return array(
+				'album_guid' => $album_guid,
+				'track_guid' => $track_guid,
+				'title'      => $track_data['title'],
+				'subtitle'   => trim( sprintf(
+					/* translators: 1: album title, 2: artist name */
+					__( 'from %1$s · %2$s', 'v4v-musiclink-pro' ),
+					$track_data['album_title'],
+					$track_data['artist']
+				), " ·" ),
+			);
+		}
+
+		// Anything without a track guid (e.g. "feed"/"album") is an
+		// album-level result.
+		$feed_data = $this->mi_get_feed( $album_guid );
+		if ( ! $feed_data ) {
+			return null;
+		}
+		return array(
+			'album_guid' => $album_guid,
+			'track_guid' => null,
+			'title'      => $feed_data['title'],
+			'subtitle'   => $feed_data['artist']
+				? sprintf( __( 'Album by %s', 'v4v-musiclink-pro' ), $feed_data['artist'] )
+				: __( 'Album', 'v4v-musiclink-pro' ),
+		);
+	}
+
+	/**
+	 * Whether the cache row already carries Music Index data for the
+	 * pair - i.e. the title lookup that follows will be served without
+	 * any outbound request (and therefore needs no rate-limit unit).
+	 */
+	private function row_has_cached_mi( $album_guid, $track_guid ) {
+		$row = $this->cache_get_row( $album_guid, $track_guid );
+
+		return $row && $this->row_has_mi( $row );
+	}
+
+	/**
+	 * Any recognised share link -> direct result payload (guids only):
+	 * Fountain first (it needs reversal), then the three guid-carrying
+	 * apps (pure parsing). Same contract everywhere:
+	 *
+	 *  - null     $q is not a share link -> the caller falls through to
+	 *             the normal Music Index title search.
+	 *  - array()  recognised but definitively absent/unusable -> "no
+	 *             results"; must NOT title-search the URL text.
+	 *  - false    recognised but unreliable (transport/5xx/over budget)
+	 *             -> failure, retried next time.
+	 *  - array    array( 'album_guid' => ..., 'track_guid' => ...|null )
+	 *             -> the direct result the UI jumps to.
+	 */
+	private function search_direct_link( $q ) {
+		$link = $this->search_fountain_link( $q );
+		if ( null !== $link ) {
+			return $link;
+		}
+		return $this->search_app_link( $q );
+	}
+
+	/**
+	 * Resolve a pasted Fountain share link (fountain.fm/{show|album|
+	 * track|episode}/{id}) into the guids a release page needs.
+	 *
+	 * The derived canonical URL is matched against the cache row's stored
+	 * fountain_url first (the plugin writes exactly this shape when it
+	 * resolves a release), which recovers the guids with no upstream call
+	 * and no rate-limit unit at all. Otherwise the official content API
+	 * reverses the id - see fountain_reverse() - with p20's
+	 * definitive-vs-soft miss caching (FAIL_CACHE_TTL / SOFT_FAIL_CACHE_TTL
+	 * under the '~' sentinel) so a Fountain blip is retried in seconds.
+	 *
+	 * @return null|array|false As search_direct_link().
+	 */
+	private function search_fountain_link( $q ) {
+		$q = trim( (string) $q );
+		if ( ! preg_match( '~^(?:https?://)?(?:www\.)?fountain\.fm/(show|album|track|episode)/([A-Za-z0-9_-]{1,64})(?:[/?#].*)?$~i', $q, $m ) ) {
+			return null;
+		}
+		$kind  = strtolower( $m[1] );
+		$id    = $m[2];
+		$canon = 'https://fountain.fm/' . $kind . '/' . $id;
+
+		// fountain_url is unindexed, but this only runs for a pasted
+		// Fountain link and the cache table is one row per release, so
+		// the scan stays cheap.
+		global $wpdb;
+		$table = $this->cache_table();
+		$row   = $wpdb->get_row(
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE fountain_url = %s LIMIT 1", $canon )
+		);
+		if ( $row ) {
+			$album      = $this->guard_guid( isset( $row->album_guid ) ? (string) $row->album_guid : '' );
+			$track      = $this->guard_guid( isset( $row->track_guid ) ? (string) $row->track_guid : '' );
+			$wants_item = in_array( $kind, array( 'track', 'episode' ), true );
+			if ( $wants_item ) {
+				// An item link only resolves from a row that knows BOTH
+				// guids - a hand-edited link on an album-only row must
+				// fall through to the API rather than jump to the album.
+				if ( '' !== $album && '' !== $track ) {
+					return array( 'album_guid' => $album, 'track_guid' => $track );
+				}
+			} elseif ( '' !== $album ) {
+				return array( 'album_guid' => $album, 'track_guid' => null );
+			}
+		}
+
+		$key    = 'fountain_frv_pro_v' . self::FOUNTAIN_API_SCHEMA . '_' . md5( $kind . '|' . $id );
+		$cached = get_transient( $key );
+		if ( false !== $cached ) {
+			if ( '~' === $cached ) {
+				return false;
+			}
+			if ( '' === $cached ) {
+				return array();
+			}
+			return is_array( $cached ) ? $cached : array();
+		}
+
+		// Only this branch - and only on the way to a real HTTP call -
+		// spends the search budget; every cache hit above is free.
+		if ( $this->search_rate_limited() ) {
+			return false;
+		}
+
+		$found = $this->fountain_reverse( $kind, $id );
+		if ( is_array( $found ) ) {
+			set_transient( $key, $found, 30 * DAY_IN_SECONDS );
+			return $found;
+		}
+		if ( '' === $found ) {
+			set_transient( $key, '', self::FAIL_CACHE_TTL );
+			return array();
+		}
+		set_transient( $key, '~', self::SOFT_FAIL_CACHE_TTL );
+		return false;
+	}
+
+	/**
+	 * One GET to Fountain's official content endpoint
+	 * (api.fountain.fm/v1/content/{kind}:id:{fountain id}) - the reverse
+	 * of the lookup the resolver uses. Verified live for music 2026-11-21:
+	 * the reversed hit._guid equals the Music Index guid (feeds resolve as
+	 * ALBUM/SHOW, tracks as TRACK with the feed guid on parent._guid and
+	 * in links as album:guid: - the shape mirrored below).
+	 *
+	 * @param string $kind        show|album|track|episode (charset-checked by the caller's regex).
+	 * @param string $fountain_id Fountain's opaque id (same charset).
+	 * @return array|string|null array( 'album_guid' => ..., 'track_guid' => ...|null ),
+	 *                           '' for a definitive miss (404, or a readable hit
+	 *                           without usable guids), null for an unreliable
+	 *                           answer (transport, 5xx, undecodable body, type
+	 *                           mismatch - a wrong prefix never proves absence).
+	 */
+	private function fountain_reverse( $kind, $fountain_id ) {
+		// redirection => 0: never follow a remote redirect (SSRF hardening).
+		$response = wp_remote_get( 'https://api.fountain.fm/v1/content/' . $kind . ':id:' . $fountain_id, array(
+			'timeout'     => 8,
+			'redirection' => 0,
+			'headers'     => array(
+				'Accept'     => 'application/json',
+				'User-Agent' => 'phafe.com-MusicLink/1.10 (' . home_url() . ')',
+			),
+		) );
+
+		if ( is_wp_error( $response ) ) {
+			return null;
+		}
+		$status = (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $status ) {
+			return 404 === $status ? '' : null;
+		}
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $body ) || ! isset( $body['hit'] ) || ! is_array( $body['hit'] ) ) {
+			return null; // An undecodable 200 proves nothing.
+		}
+
+		$hit  = $body['hit'];
+		$type = isset( $hit['_type'] ) ? strtoupper( (string) $hit['_type'] ) : '';
+		$want = array(
+			'show'    => 'SHOW',
+			'album'   => 'ALBUM',
+			'track'   => 'TRACK',
+			'episode' => 'EPISODE',
+		);
+		$want = isset( $want[ $kind ] ) ? $want[ $kind ] : '';
+		if ( '' === $want || $want !== $type ) {
+			// Fountain answers 500 for a real id under the wrong type
+			// prefix (live-confirmed), and a mismatched 200 would be no
+			// answer either: unreliable, never "absent".
+			return null;
+		}
+
+		$item = $this->guard_guid( isset( $hit['_guid'] ) ? (string) $hit['_guid'] : '' );
+		if ( 'show' === $kind || 'album' === $kind ) {
+			return '' !== $item ? array( 'album_guid' => $item, 'track_guid' => null ) : '';
+		}
+
+		// Item links need the parent feed guid too - parent._guid first,
+		// then the links array (album:guid: / show:guid: both carry the
+		// feed guid Fountain filed the parent under; music feeds surface
+		// as album:guid:, podcast-style ones as show:guid:).
+		$album = '';
+		if ( isset( $body['parent'] ) && is_array( $body['parent'] ) ) {
+			$album = $this->guard_guid( isset( $body['parent']['_guid'] ) ? (string) $body['parent']['_guid'] : '' );
+		}
+		if ( '' === $album && isset( $hit['links'] ) && is_array( $hit['links'] ) ) {
+			foreach ( $hit['links'] as $link ) {
+				if ( ! is_string( $link ) ) {
+					continue;
+				}
+				foreach ( array( 'album:guid:', 'show:guid:' ) as $prefix ) {
+					if ( 0 === strpos( $link, $prefix ) ) {
+						$album = $this->guard_guid( substr( $link, strlen( $prefix ) ) );
+						if ( '' !== $album ) {
+							break 2;
+						}
+					}
+				}
+			}
+		}
+
+		return ( '' !== $item && '' !== $album )
+			? array( 'album_guid' => $album, 'track_guid' => $item )
+			: '';
+	}
+
+	/**
+	 * Resolve another target app's share URL - the URL shapes these
+	 * plugins themselves emit, so reversal is pure parsing with no HTTP:
+	 *
+	 *  - stablekraft.app/album/{album guid}[?track={track guid}]
+	 *  - podtunes.app/g/{album guid}[/{track guid}]
+	 *  - v4vmusic.com/lookup/{album guid}[/{track guid}]
+	 *
+	 * Schemeless pastes still parse ('https://' prepended), 'www.' is
+	 * ignored, query strings beyond the documented ones are ignored, and
+	 * every extracted guid passes guard_guid().
+	 *
+	 * @return null|array|false As search_direct_link().
+	 */
+	private function search_app_link( $q ) {
+		$q = trim( (string) $q );
+		if ( ! preg_match( '~^[A-Za-z][A-Za-z0-9+.\-]*://~', $q ) ) {
+			$q = 'https://' . $q; // Bare domain pastes still parse.
+		}
+		$parts = wp_parse_url( $q );
+		if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+			return null;
+		}
+		$host = strtolower( preg_replace( '/^www\./i', '', (string) $parts['host'] ) );
+		$path = isset( $parts['path'] ) ? (string) $parts['path'] : '';
+		$query_args = array();
+		if ( ! empty( $parts['query'] ) ) {
+			parse_str( $parts['query'], $query_args );
+		}
+
+		// Path segments are captured encoded (they may carry free-form
+		// Music Index id characters) and decoded before guarding.
+		switch ( $host ) {
+			case 'stablekraft.app':
+				// stablekraft.app/album/{album}[?track={track}]
+				if ( ! preg_match( '~^/album/([^/?#]{1,2048})/?$~', $path, $m ) ) {
+					return null;
+				}
+				return $this->direct_pair(
+					rawurldecode( $m[1] ),
+					isset( $query_args['track'] ) ? (string) $query_args['track'] : ''
+				);
+
+			case 'podtunes.app':
+				// podtunes.app/g/{album}[/{track}]
+				if ( ! preg_match( '~^/g/([^/?#]{1,2048})(?:/([^/?#]{1,2048}))?/?$~', $path, $m ) ) {
+					return null;
+				}
+				return $this->direct_pair(
+					rawurldecode( $m[1] ),
+					isset( $m[2] ) && '' !== $m[2] ? rawurldecode( $m[2] ) : ''
+				);
+
+			case 'v4vmusic.com':
+				// v4vmusic.com/lookup/{album}[/{track}]
+				if ( ! preg_match( '~^/lookup/([^/?#]{1,2048})(?:/([^/?#]{1,2048}))?/?$~', $path, $m ) ) {
+					return null;
+				}
+				return $this->direct_pair(
+					rawurldecode( $m[1] ),
+					isset( $m[2] ) && '' !== $m[2] ? rawurldecode( $m[2] ) : ''
+				);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Build the direct payload for a pair of extracted guids. A URL whose
+	 * album guid fails the guard is recognised-but-unusable (array():
+	 * "no results", never a title search of the URL text); a missing
+	 * track part simply makes it an album-level result.
+	 */
+	private function direct_pair( $album, $track ) {
+		$album = $this->guard_guid( (string) $album );
+		$track = $this->guard_guid( (string) $track );
+		if ( '' === $album ) {
+			return array();
+		}
+
+		return array(
+			'album_guid' => $album,
+			'track_guid' => '' !== $track ? $track : null,
+		);
+	}
+
+	/**
 	 * Resolves a guid to Fountain's opaque internal ID plus the content
-	 * type Fountain filed it under, via their unofficial Server Action
+	 * type Fountain filed it under. Returns array( 'id' => ..., 'type' =>
+	 * ... ) or null on any failure - so the caller can fall back to a
+	 * plain link.
+	 *
+	 * Two resolvers, in order (O28):
+	 *
+	 *  1. The official no-key API (POST api.fountain.fm/v1/search/lookup,
+	 *     the call p20-link-resolver has used live since 2026-11-12). It
+	 *     is stable across Fountain redeploys, so a release resolved here
+	 *     no longer depends on the next-action fingerprint churn at all
+	 *     (the O7/O9/O11 self-heal machinery simply never runs).
+	 *  2. The unofficial Next.js Server Action - the historic path - as
+	 *     AUTOMATIC FALLBACK for every case the API could not answer:
+	 *     transport trouble, over budget, or a miss that needs the
+	 *     title-based search index the API's guid lookup cannot query
+	 *     (a track guid passed without its parent feed, for one).
+	 *
+	 * Successes from either are cached for a long time (30 days) since a
+	 * release's Fountain ID never changes once assigned; misses are
+	 * remembered briefly (see fountain_api_resolve() and
+	 * fountain_negative_cache_ttl()) so a temporary failure doesn't cause
+	 * a repeated slow request on every page view.
+	 *
+	 * @param string $guid        Album/feed guid, or a track guid when $parent_guid says which feed it belongs to.
+	 * @param string $search_text Title the legacy search action matches on.
+	 * @param string $parent_guid Album/feed guid of the release - required for the official API to accept a track guid.
+	 */
+	private function fountain_resolve( $guid, $search_text, $parent_guid = '' ) {
+		$api = $this->fountain_api_resolve( $guid, $parent_guid );
+
+		if ( is_array( $api ) ) {
+			return $api;
+		}
+
+		$result = $this->fountain_resolve_legacy( $guid, $search_text );
+
+		if ( '' === $api && ! $this->last_fountain_hits_parsed ) {
+			// The API gave a DEFINITIVE "not in Fountain" (200 with a
+			// readable hits array lacking our guid) while the legacy path
+			// could not confirm an answer of its own (over budget,
+			// transport, stale next-action, unparsable body - anything
+			// leaving the flag false). Promote the API's readable "no" so
+			// the render's album-page fallback for a track the search
+			// index omits still runs: that fallback is gated on this very
+			// flag, and the API's answer is exactly the signal it needs.
+			// A soft API miss (false) or a skipped attempt (null) changes
+			// nothing - an unconfirmed "no" must stay unconfirmed.
+			$this->last_fountain_hits_parsed = true;
+		}
+
+		return $result;
+	}
+
+	/**
+	 * Resolves a guid to Fountain's opaque internal ID plus type through
+	 * the OFFICIAL no-key API - POST api.fountain.fm/v1/search/lookup,
+	 * documented at fountain.fm/docs.md (O28). Verified live for music
+	 * guids 2026-11-21: an album/feed guid goes up as
+	 * podcast:guid:{guid} and answers with SHOW/ALBUM hits; a TRACK guid
+	 * only resolves TOGETHER with its parent feed guid
+	 * (podcast:item:guid: + parent) - alone the API answers 400
+	 * "missing parent guid" - which is why render() passes the album
+	 * alongside a track target.
+	 *
+	 * Return contract:
+	 *  - array( 'id' => ..., 'type' => ... )  hit.
+	 *  - ''   DEFINITIVE miss: 200 with a readable hits array lacking
+	 *        our guid, or 404 (p20's rule: a 404 from the API is a real
+	 *        "no", not a transport wobble).
+	 *  - false UNRELIABLE answer: transport error, 5xx, redirect, or a
+	 *        200 body we could not read.
+	 *  - null nothing was asked: over budget - no HTTP, nothing
+	 *        remembered, so the window - not the cache - limits a burst
+	 *        (security review O25).
+	 *
+	 * The caller treats only '' as readable ("Fountain does not have
+	 * this") and falls through to the legacy path in every other
+	 * non-hit case, so an API problem can only ever cost one extra
+	 * attempt - never the link.
+	 *
+	 * Misses are cached under '~' - outside the [A-Za-z0-9_-] id
+	 * alphabet - so a soft miss can never be read back as a definitive
+	 * one and pin the fallback for a full FAIL_CACHE_TTL instead of
+	 * retrying in 30 seconds.
+	 */
+	private function fountain_api_resolve( $guid, $parent_guid = '' ) {
+		$guid   = $this->guard_guid( (string) $guid );
+		$parent = $this->guard_guid( (string) $parent_guid );
+		if ( '' === $guid ) {
+			return null;
+		}
+
+		$cache_key = 'fountain_api_pro_v' . self::FOUNTAIN_API_SCHEMA . '_' . md5( $guid . '|' . $parent );
+		$cached    = get_transient( $cache_key );
+		if ( false !== $cached ) {
+			if ( is_array( $cached ) ) {
+				return $cached;
+			}
+			return '' === $cached ? '' : false;
+		}
+
+		// Same per-IP resolve budget as the legacy POSTs, charged only
+		// when a request would actually go out (the cached hit above is
+		// free): a rejection returns before any HTTP and writes no entry
+		// (security review O25).
+		if ( $this->resolve_budgeted && $this->is_rate_limited( 'resolve', self::RESOLVE_RATE_MAX, MINUTE_IN_SECONDS ) ) {
+			return null;
+		}
+
+		// An item (track) lookup is only valid WITH its parent feed; a
+		// feed guid goes up on its own. $parent === $guid would be a
+		// caller mistake, so it degrades to the feed shape.
+		$payload = array( 'id' => 'podcast:guid:' . $guid );
+		if ( '' !== $parent && $parent !== $guid ) {
+			$payload = array(
+				'id'     => 'podcast:item:guid:' . $guid,
+				'parent' => 'podcast:guid:' . $parent,
+			);
+		}
+
+		// redirection => 0: never follow a remote redirect (SSRF
+		// hardening), same rule as every other outbound call here.
+		$response = wp_remote_post( 'https://api.fountain.fm/v1/search/lookup', array(
+			'timeout'     => 8,
+			'redirection' => 0,
+			'headers'     => array(
+				'Content-Type' => 'application/json',
+				'Accept'       => 'application/json',
+				'User-Agent'   => 'phafe.com-MusicLink/1.10 (' . home_url() . ')',
+			),
+			'body'        => wp_json_encode( $payload ),
+		) );
+
+		if ( is_wp_error( $response ) ) {
+			set_transient( $cache_key, '~', self::SOFT_FAIL_CACHE_TTL );
+			return false;
+		}
+
+		$status = (int) wp_remote_retrieve_response_code( $response );
+		if ( 404 === $status ) {
+			set_transient( $cache_key, '', self::FAIL_CACHE_TTL );
+			return '';
+		}
+		if ( 200 !== $status ) {
+			set_transient( $cache_key, '~', self::SOFT_FAIL_CACHE_TTL );
+			return false;
+		}
+
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $body ) || ! isset( $body['hits'] ) || ! is_array( $body['hits'] ) ) {
+			// An undecodable 200 proves nothing (proxy hiccup) - soft.
+			set_transient( $cache_key, '~', self::SOFT_FAIL_CACHE_TTL );
+			return false;
+		}
+
+		// Readable from here on, hit or miss. Match by _guid rather than
+		// by position: one feed guid legitimately answers with several
+		// hits (SHOW plus one or more ALBUM ids) and the first guid match
+		// is what the legacy search path would have taken too - the type
+		// then picks the URL prefix via fountain_path_segment().
+		foreach ( $body['hits'] as $hit ) {
+			if ( ! is_array( $hit ) || ! isset( $hit['_id'], $hit['_guid'] ) || $hit['_guid'] !== $guid ) {
+				continue;
+			}
+			// The docs describe ContentIDs as "{type}:id:{id}"; live
+			// lookup responses have carried the bare id. Accept both, and
+			// refuse anything outside Fountain's opaque id alphabet so a
+			// surprising payload can never reach a URL (p20's rule).
+			$id = preg_replace( '/^(show|album|track|episode):id:/', '', (string) $hit['_id'] );
+			if ( ! preg_match( '/^[A-Za-z0-9_-]{1,128}$/', $id ) ) {
+				set_transient( $cache_key, '~', self::SOFT_FAIL_CACHE_TTL );
+				return false;
+			}
+			$found = array(
+				'id'   => $id,
+				'type' => isset( $hit['_type'] ) ? strtoupper( (string) $hit['_type'] ) : '',
+			);
+			set_transient( $cache_key, $found, 30 * DAY_IN_SECONDS );
+			return $found;
+		}
+
+		set_transient( $cache_key, '', self::FAIL_CACHE_TTL );
+		return '';
+	}
+
+	/**
+	 * The historic resolution path: Fountain's unofficial Server Action
 	 * search endpoint. Returns array( 'id' => ..., 'type' => ... ) or
 	 * null on any failure - missing config, network error, unexpected
 	 * response shape, or no matching hit - so the caller can fall back to
-	 * a plain link.
+	 * a plain link. Kept as the automatic fallback behind the official
+	 * API (see fountain_resolve()); everything below predates that and
+	 * behaves exactly as it always has.
 	 *
 	 * Successes are cached for a long time (30 days) since a release's
 	 * Fountain ID never changes once assigned. Failures are cached briefly
@@ -3663,7 +4252,7 @@ JS;
 	 * once the hash is fixed.
 	 */
 
-	private function fountain_resolve( $guid, $search_text ) {
+	private function fountain_resolve_legacy( $guid, $search_text ) {
 		$next_action = get_option( 'v4v_musiclink_pro_fountain_next_action', '' );
 		if ( ! $next_action && defined( 'V4V_MUSICLINK_FOUNTAIN_NEXT_ACTION' ) ) {
 			$next_action = V4V_MUSICLINK_FOUNTAIN_NEXT_ACTION; // Optional fallback for advanced users.

@@ -16,8 +16,8 @@ This is the **Pro** version. The standard version lives in the sibling repositor
   ```
   https://example.com/musiclink?album={album-guid}&track={track-guid}
   ```
-- **Front-end search:** with no parameters in the shortcode or the URL, the page shows a search UI against Music Index; picking a result renders the regular release page (shareable URL).
-- **Fountain.fm resolution:** deep links are resolved via Fountain's unofficial Server Action endpoint, with automatic self-healing of the `next-action` fingerprint and a search fallback (`https://fountain.fm/search?q="…"`) when nothing resolves.
+- **Front-end search:** with no parameters in the shortcode or the URL, the page shows a search UI against Music Index; picking a result renders the regular release page (shareable URL). Pasting a share link for one of the target apps (or Fountain) is recognised directly and jumps to that release instead of being title-searched.
+- **Fountain.fm resolution:** deep links are resolved through Fountain's official no-key API (`POST api.fountain.fm/v1/search/lookup`) first, with the unofficial Server Action endpoint (and its self-healing `next-action` fingerprint) kept as automatic fallback when the API cannot answer, and a search fallback (`https://fountain.fm/search?q="…"`) when nothing resolves.
 - **Launch/open logging:** one row when a visitor picks a search result, plus one row per app-button launch. Page renders (including shared links) are never logged and raw guids are never stored. Both beacons are per-IP rate-limited (30/min per endpoint by default, configurable); the log keeps only its newest rows (100,000 by default).
 - **Admin tabs:** View Log (with Clear log), Reports (totals by artist/album/track or by music app, with date-range and artist filters), and a **Cache** tab listing cached release rows (date-only Music Index and Fountain.fm timestamps, tick/cross art status) with per-row artwork/Fountain URL editing, launch, delete, and clear-links actions.
 - **Extras:** Open Graph / Twitter Card social previews, a share button, and canonical URL fixes for guid'd URLs.
@@ -31,7 +31,7 @@ This is the **Pro** version. The standard version lives in the sibling repositor
 | StableKraft.app | Formulaic GUID-based URL, no lookup required |
 | PodTunes.app | Formulaic GUID-based URL, no lookup required |
 | v4vmusic.com | Formulaic GUID-based URL (`/lookup/{album}` or `/lookup/{album}/{track}`) |
-| Fountain.fm | Resolved via the unofficial Server Action endpoint, with automatic self-healing of the `next-action` fingerprint; falls back to a pre-filled exact-phrase search on the release title (or `fountain.fm/discover` when no title is known) |
+| Fountain.fm | Resolved through the official no-key lookup API (`api.fountain.fm/v1/search/lookup`) first, falling back to the unofficial Server Action endpoint (with automatic self-healing of the `next-action` fingerprint) when the API cannot answer; final fallback is a pre-filled exact-phrase search on the release title (or `fountain.fm/discover` when no title is known) |
 
 ## Data source
 
