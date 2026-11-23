@@ -5,8 +5,11 @@
 The project consists of:
 
 - `v4v-musiclink-pro.php` — the Pro WordPress plugin (current release)
-- `tests/` — tracked regression suite (`test_*.php` / `*_test.php` harnesses,
-  `wpstub/`, `fx_*.txt` fixtures, `e2e/` scripts)
+- `tests/` — local regression suite (`test_*.php` / `*_test.php` harnesses,
+  `wpstub/`, `fx_*.txt` fixtures, `e2e/` scripts). **Gitignored on purpose
+  (since `a7b5f70`): never commit or push it** — it is this machine's
+  tooling, run locally with `./php/php`. A fresh clone has neither `tests/`
+  nor `php/`.
 - `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `OUTSTANDING.md`
 - `bump-version.sh`, `php/install.sh`
 
@@ -37,7 +40,8 @@ and is **not** part of the project.
 ## Also not part of the project
 
 - `tmp/` — gitignored local scratch (live probes, captured e2e HTML/logs,
-  downloaded archives); the harness suite lives in tracked `tests/`.
+  downloaded archives); the harness suite lives in the gitignored `tests/`
+  (local-only, never pushed - see Project scope).
 - `php/php` and `php/*.tar.gz` — gitignored downloaded toolchain; `php/install.sh`
   is the tracked source of truth.
 - `.env*` — never read or report on these.

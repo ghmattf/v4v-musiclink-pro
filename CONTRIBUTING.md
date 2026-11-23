@@ -16,7 +16,7 @@
 
 ## Regression tests
 
-The suite is a set of standalone harnesses in the tracked `tests/` directory (plus `tests/wpstub/` WordPress stubs, the `tests/fx_*.txt` captured-response fixtures, and `tests/e2e/` scripts). Run them all from the project root after any change, and always before a release:
+The suite is a set of standalone harnesses in the local `tests/` directory — gitignored on purpose and **never committed or pushed** (they are this machine's tooling; a fresh clone has neither `tests/` nor `php/`) — plus `tests/wpstub/` WordPress stubs, the `tests/fx_*.txt` captured-response fixtures, and `tests/e2e/` scripts. Run them all from the project root after any change, and always before a release:
 
 ```bash
 for f in tests/test_*.php tests/*_test.php; do ./php/php "$f"; done
