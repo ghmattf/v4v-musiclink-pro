@@ -89,4 +89,28 @@ Applies to code releases only (never for docs-only changes):
    `archive/` stay uncommitted. Never `git add -A` here.
 6. Annotated, `v`-prefixed tags: `git tag -a vx.y.z -m "Pro x.y.z"`. Then push
    to GitHub: `git push && git push origin vx.y.z`.
-7. Update `OUTSTANDING.md` statuses in the same turn; remove any item just shipped.
+7. **Publish the GitHub release with an installable zip — this is what
+   "release" means.** A release is not finished until the plugin can be
+   uploaded in WordPress admin → Plugins → Add New → Upload Plugin, so
+   always build the zip, attach it, and **end the turn with the release
+   URL**. From the repo root, on a clean checkout of the tag:
+
+   ```bash
+   rm -rf tmp/pkg && mkdir -p tmp/pkg/v4v-musiclink-pro
+   cp v4v-musiclink-pro.php tmp/pkg/v4v-musiclink-pro/
+   (cd tmp/pkg && zip -qr -X ../../v4v-musiclink-pro-x.y.z.zip v4v-musiclink-pro)
+   gh release create vx.y.z v4v-musiclink-pro-x.y.z.zip \
+     --title "Pro x.y.z" \
+     --notes-file <(awk "/^## Resolver Pro .*\\[x.y.z\\]/{f=1;next} /^## Resolver Pro /{f=0} f" CHANGELOG.md)
+   gh release view vx.y.z --json url -q .url
+   ```
+
+   The zip must hold a **single `v4v-musiclink-pro/` folder** containing
+   the plugin file (WordPress extracts into `wp-content/plugins/<folder>`,
+   so nothing may sit at the zip root) — one file, since this is a
+   single-file plugin. Never commit the zip: it lives under the gitignored
+   `tmp/`. If the tag is already pushed but no GitHub release exists yet,
+   publish it on that existing tag rather than bumping again.
+   The deliverable to the user is the URL, e.g.
+   `https://github.com/ghmattf/v4v-musiclink-pro/releases/tag/vx.y.z`.
+8. Update `OUTSTANDING.md` statuses in the same turn; remove any item just shipped.
